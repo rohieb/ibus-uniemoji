@@ -6,7 +6,7 @@ SYSCONFDIR ?= /etc
 DATADIR ?= $(PREFIX)/share
 DESTDIR ?=
 
-PYTHON ?= /usr/bin/python2
+PYTHON ?= /usr/bin/python3
 
 all: uniemoji.xml
 
