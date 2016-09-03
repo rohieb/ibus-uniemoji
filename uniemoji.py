@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # UniEmoji: ibus engine for unicode emoji and symbols by name
 #
@@ -20,13 +20,12 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 
-from __future__ import print_function
-
 from gi.repository import IBus
 from gi.repository import GLib
 from gi.repository import GObject
 
 import os
+import re
 import sys
 import json
 import getopt
@@ -61,7 +60,14 @@ del n
 
 __base_dir__ = os.path.dirname(__file__)
 
-RANGES = (
+VALID_CATEGORIES = (
+    'Sm', # Symbol, math
+    'So', # Symbol, other
+    'Pd', # Punctuation, dash
+    'Po', # Punctuation, other
+)
+
+VALID_RANGES = (
     (0x2000, 0x206f), # General Punctuation, Layout Controls, Invisible Operators
     (0x2070, 0x209f), # Superscripts and Subscripts
     (0x20a0, 0x20cf), # Currency Symbols
@@ -102,7 +108,7 @@ RANGES = (
 )
 
 def in_range(code):
-    return any(x <= code <= y for x,y in RANGES)
+    return any(x <= code <= y for x,y in VALID_RANGES)
 
 MATCH_LIMIT = 100
 
@@ -123,6 +129,13 @@ class UniEmojiChar(object):
         self.is_emojione = is_emojione
         self.is_custom = is_custom
 
+    def __repr__(self):
+        return 'UniEmojiChar(unicode_str={}, is_emojione={}, is_custom={}, aliasing={})'.format(
+            self.unicode_str,
+            self.is_emojione,
+            self.is_custom,
+            self.aliasing)
+
 
 # the engine
 class UniEmoji(IBus.Engine):
@@ -131,11 +144,12 @@ class UniEmoji(IBus.Engine):
     def __init__(self):
         super(UniEmoji, self).__init__()
         self.is_invalidate = False
-        self.preedit_string = u""
+        self.preedit_string = ''
         self.lookup_table = IBus.LookupTable.new(10, 0, True, True)
         self.prop_list = IBus.PropList()
         self.table = defaultdict(UniEmojiChar)
         self.unicode_chars_to_names = {}
+        self.unicode_chars_to_shortnames = {}
         self.ascii_table = {}
         self.reverse_ascii_table = {}
         self.alias_table = {}
@@ -144,12 +158,12 @@ class UniEmoji(IBus.Engine):
                 if not line.strip(): continue
                 code, name, category, _ = line.split(';', 3)
                 code = int(code, 16)
+                if category not in VALID_CATEGORIES:
+                    continue
                 if not in_range(code):
                     continue
-                if category not in ('Sm', 'So', 'Po'):
-                    continue
                 name = name.lower()
-                unicode_char = unichr(code)
+                unicode_char = chr(code)
                 self.table[name] = UniEmojiChar(unicode_char)
                 self.unicode_chars_to_names[unicode_char] = name
 
@@ -158,8 +172,19 @@ class UniEmoji(IBus.Engine):
         temp_alias_table = defaultdict(set)
 
         emojione = json.load(codecs.open(os.path.join(__base_dir__, 'emojione.json'), encoding='utf-8'))
-        for emoji_shortname, info in emojione.iteritems():
-            unicode_str = u''.join(unichr(int(codepoint, 16)) for codepoint in info['unicode'].split('-'))
+        for emoji_shortname, info in emojione.items():
+
+            # ZWJ emojis such as 'family', 'couple', and 'kiss' appear in an
+            # alternate field
+            alternate_form = info.get('unicode_alternates')
+            if alternate_form and '200d' in alternate_form:
+                chars = alternate_form
+            else:
+                chars = info['unicode']
+
+            unicode_str = ''.join(chr(int(codepoint, 16)) for codepoint in chars.split('-'))
+            self.unicode_chars_to_shortnames[unicode_str] = emoji_shortname
+
             emoji_shortname = emoji_shortname.replace('_', ' ')
 
             if emoji_shortname in self.table:
@@ -183,7 +208,9 @@ class UniEmoji(IBus.Engine):
                 if long_name not in self.table:
                     self.table[long_name] = UniEmojiChar(unicode_str)
 
-            for alias in info.get('keywords', []):
+            # EmojiOne has duplicate entries in the keywords array
+            keywords = set(info.get('keywords', []))
+            for alias in keywords:
                 alias_counter[alias] += 1
                 temp_alias_table[alias].add(unicode_str)
 
@@ -210,15 +237,35 @@ class UniEmoji(IBus.Engine):
                     error = sys.exc_info()[1]
                     debug(error)
                     self.table = {
-                        u'Failed to load custom file {}: {}'.format(custom_filename, error): u'ERROR'
+                        'Failed to load custom file {}: {}'.format(custom_filename, error): 'ERROR'
                     }
                     break
                 else:
                     debug(custom_table)
-                    for k, v in custom_table.iteritems():
+                    for k, v in custom_table.items():
                         self.table[k] = UniEmojiChar(v, is_custom=True)
 
         debug("Create UniEmoji engine OK")
+
+    def set_lookup_table_cursor_pos_in_current_page(self, index):
+        '''Sets the cursor in the lookup table to index in the current page
+
+        Returns True if successful, False if not.
+        '''
+        page_size = self.lookup_table.get_page_size()
+        if index > page_size:
+            return False
+        page, pos_in_page = divmod(self.lookup_table.get_cursor_pos(),
+                                   page_size)
+        new_pos = page * page_size + index
+        if new_pos > self.lookup_table.get_number_of_candidates():
+            return False
+        self.lookup_table.set_cursor_pos(new_pos)
+        return True
+
+    def do_candidate_clicked(self, index, dummy_button, dummy_state):
+        if self.set_lookup_table_cursor_pos_in_current_page(index):
+            self.commit_candidate()
 
     def do_process_key_event(self, keyval, keycode, state):
         debug("process_key_event(%04x, %04x, %04x)" % (keyval, keycode, state))
@@ -236,7 +283,7 @@ class UniEmoji(IBus.Engine):
                     self.commit_string(self.preedit_string)
                 return True
             elif keyval == IBus.Escape:
-                self.preedit_string = u""
+                self.preedit_string = ''
                 self.update_candidates()
                 return True
             elif keyval == IBus.BackSpace:
@@ -245,17 +292,10 @@ class UniEmoji(IBus.Engine):
                 return True
             elif keyval in num_keys[1:]:
                 index = num_keys.index(keyval) - 1
-                page_size = self.lookup_table.get_page_size()
-                if index > page_size:
-                    return False
-                page, pos_in_page = divmod(self.lookup_table.get_cursor_pos(),
-                                           page_size)
-                new_pos = page * page_size + index
-                if new_pos > self.lookup_table.get_number_of_candidates():
-                    return False
-                self.lookup_table.set_cursor_pos(new_pos)
-                self.commit_candidate()
-                return True
+                if self.set_lookup_table_cursor_pos_in_current_page(index):
+                    self.commit_candidate()
+                    return True
+                return False
             elif keyval == IBus.Page_Up or keyval == IBus.KP_Page_Up:
                 self.page_up()
                 return True
@@ -270,17 +310,17 @@ class UniEmoji(IBus.Engine):
                 return True
             elif keyval == IBus.Left or keyval == IBus.Right:
                 return True
-        if (keyval in xrange(IBus.a, IBus.z + 1) or
-            keyval in xrange(IBus.A, IBus.Z + 1) or
-            keyval == IBus.space):
-            if keyval == IBus.space and len(self.preedit_string) == 0:
-                # Insert space if that's all you typed (so you can more easily
-                # type a bunch of emoji separated by spaces)
-                # there's a bug here, it's inserting two spaces
-                self.commit_string(' ')
-                return False
+
+        if keyval == IBus.space and len(self.preedit_string) == 0:
+            # Insert space if that's all you typed (so you can more easily
+            # type a bunch of emoji separated by spaces)
+            return False
+
+        # Allow typing all ASCII letters and punctuation, except digits
+        if ord(' ') <= keyval < ord('0') or \
+           ord('9') < keyval <= ord('~'):
             if state & (IBus.ModifierType.CONTROL_MASK | IBus.ModifierType.MOD1_MASK) == 0:
-                self.preedit_string += unichr(keyval)
+                self.preedit_string += chr(keyval)
                 self.invalidate()
                 return True
         else:
@@ -322,7 +362,7 @@ class UniEmoji(IBus.Engine):
 
     def commit_string(self, text):
         self.commit_text(IBus.Text.new_from_string(text))
-        self.preedit_string = u""
+        self.preedit_string = ''
         self.update_candidates()
 
     def commit_candidate(self):
@@ -335,6 +375,18 @@ class UniEmoji(IBus.Engine):
 
         if candidates is None: candidates = self.table
 
+        # Replace '_' in query with ' ' since that's how emojione names are stored
+        query = query.replace('_', ' ')
+
+        query_words = []
+        for w in query.split():
+            escaped_w = re.escape(w)
+            query_words.append((
+                w,
+                re.compile(r'\b' + escaped_w + r'\b'),
+                re.compile(r'\b' + escaped_w),
+            ))
+
         # Matches are tuples of the form:
         # (match_type, score, name)
         # Match types are:
@@ -344,7 +396,7 @@ class UniEmoji(IBus.Engine):
         # * 0 - levenshtein distance
         matched = []
 
-        for candidate, candidate_info in candidates.iteritems():
+        for candidate, candidate_info in candidates.items():
             if len(query) > len(candidate): continue
 
             if query == candidate:
@@ -355,11 +407,31 @@ class UniEmoji(IBus.Engine):
                     matched.append((5, 0, candidate, CANDIDATE_ALIAS))
             else:
                 # Substring match
-                query_words = query.split()
-                word_ixs = [candidate.find(w) for w in query_words]
-                if all(ix >= 0 for ix in word_ixs):
+                word_ixs = []
+                substring_found = False
+                exact_word_match = 0
+                prefix_match = 0
+                for w, exact_regex, prefix_regex in query_words:
+                    ix = candidate.find(w)
+                    if ix == -1:
+                        word_ixs.append(100)
+                    else:
+                        substring_found = True
+                        word_ixs.append(ix)
+
+                        # Check if an exact word match or a prefix match
+                        if exact_regex.search(candidate):
+                            exact_word_match += 1
+                        elif prefix_regex.search(candidate):
+                            prefix_match += 1
+
+                if substring_found and all(ix >= 0 for ix in word_ixs):
                     # For substrings, the closer to the origin, the better
                     score = -(float(sum(word_ixs)) / len(word_ixs))
+
+                    # Receive a boost if the substring matches a word or a prefix
+                    score += 20 * exact_word_match + 10 * prefix_match
+
                     if candidate_info.unicode_str:
                         matched.append((10, score, candidate, CANDIDATE_UNICODE))
                     if candidate_info.aliasing:
@@ -390,7 +462,10 @@ class UniEmoji(IBus.Engine):
                             elif [j2] == ' ':
                                 score += 1
                     if score > 0:
-                        matched.append((0, score, candidate, CANDIDATE_UNICODE))
+                        if candidate_info.unicode_str:
+                            matched.append((0, score, candidate, CANDIDATE_UNICODE))
+                        if candidate_info.aliasing:
+                            matched.append((0, score, candidate, CANDIDATE_ALIAS))
 
         # The first two fields are sorted in reverse.
         # The third text field is sorted by the length of the string, then alphabetically.
@@ -410,9 +485,9 @@ class UniEmoji(IBus.Engine):
             ascii_match = self.ascii_table.get(self.preedit_string)
             if ascii_match:
                 unicode_name = self.reverse_ascii_table[ascii_match]
-                display_str = u'{}: {} ({})'.format(ascii_match, unicode_name, self.preedit_string)
+                display_str = '{}: {} [{}]'.format(ascii_match, unicode_name, self.preedit_string)
                 candidate = IBus.Text.new_from_string(display_str)
-                self.candidates.append(unicode_name)
+                self.candidates.append(ascii_match)
                 self.lookup_table.append_candidate(candidate)
 
             # Look for a fuzzy match against a description
@@ -430,12 +505,18 @@ class UniEmoji(IBus.Engine):
                     if uniemoji_char.is_emojione:
                         unicode_name = self.unicode_chars_to_names.get(uniemoji_char.unicode_str)
                         if unicode_name and unicode_name != name:
-                            display_str = u'{}: {} (:{}:)'.format(
+                            display_str = '{}: :{}: {}'.format(
                                 uniemoji_char.unicode_str,
-                                unicode_name,
-                                name.replace(' ', '_'))
+                                name.replace(' ', '_'),
+                                unicode_name)
                     if display_str is None:
-                        display_str = u'{}: {}'.format(uniemoji_char.unicode_str, name)
+                        shortname = self.unicode_chars_to_shortnames.get(uniemoji_char.unicode_str, '')
+                        if shortname:
+                            shortname = ':' + shortname + ': '
+                        display_str = '{}: {}{}'.format(
+                            uniemoji_char.unicode_str,
+                            shortname,
+                            name)
 
                     candidate = IBus.Text.new_from_string(display_str)
                     self.candidates.append(uniemoji_char.unicode_str)
@@ -447,8 +528,12 @@ class UniEmoji(IBus.Engine):
                         continue
                     candidate_strings.add(unicode_str)
                     unicode_name = self.unicode_chars_to_names.get(unicode_str)
-                    display_str = u'{}: {} ({})'.format(
+                    shortname = self.unicode_chars_to_shortnames.get(unicode_str, '')
+                    if shortname:
+                        shortname = ':' + shortname + ': '
+                    display_str = '{}: {}{} [{}]'.format(
                         unicode_str,
+                        shortname,
                         unicode_name,
                         name)
                     candidate = IBus.Text.new_from_string(display_str)
@@ -482,11 +567,16 @@ class UniEmoji(IBus.Engine):
 
     def do_reset(self):
         debug("reset")
-        self.preedit_string = u""
+        self.preedit_string = ''
 
     def do_property_activate(self, prop_name):
         debug("PropertyActivate(%s)" % prop_name)
 
+    def do_page_up(self):
+        return self.page_up()
+
+    def do_page_down(self):
+        return self.page_down()
 
 ###########################################################################
 # the app (main interface to ibus)
